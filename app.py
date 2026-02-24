@@ -1,47 +1,24 @@
 import os
-import re
-import json
 import base64
-import tempfile
-import subprocess
+import requests
 from pathlib import Path
 
 import streamlit as st
 
 
+# =========================
+# Config
+# =========================
 APP_NAME = "Olívia Claquete Crompress"
 BASE_DIR = Path(__file__).resolve().parent
 LOGO_PATH = BASE_DIR / "logo.png"
+
+API_URL = "http://0.0.0.0:8000"  # <<< ALTERE AQUI
 
 
 # =========================
 # Utils
 # =========================
-def run_cmd(cmd):
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE, text=True)
-    out, err = p.communicate()
-    return p.returncode, out, err
-
-
-def ffmpeg_exists():
-    return run_cmd(["ffmpeg", "-version"])[0] == 0
-
-
-def ffprobe_json(path):
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-print_format", "json",
-        "-show_streams",
-        "-show_format",
-        path
-    ]
-    code, out, err = run_cmd(cmd)
-    if code != 0:
-        raise RuntimeError(err)
-    return json.loads(out)
-
-
 def human_size(num):
     for unit in ["B", "KB", "MB", "GB"]:
         if num < 1024:
@@ -54,34 +31,27 @@ def b64_image(path):
     return base64.b64encode(path.read_bytes()).decode()
 
 
-def run_ffmpeg_with_progress(cmd, total_duration, progress_bar, status_text):
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1
+def compress_via_api(video_bytes, preset, crf):
+    files = {
+        "file": ("video.mp4", video_bytes, "video/mp4")
+    }
+
+    params = {
+        "preset": preset,
+        "crf": crf
+    }
+
+    response = requests.post(
+        API_URL,
+        files=files,
+        params=params,
+        timeout=900
     )
 
-    pattern = re.compile(r"out_time_ms=(\d+)")
+    if response.status_code != 200:
+        raise RuntimeError(response.text)
 
-    for line in process.stdout:
-        match = pattern.search(line)
-        if match:
-            out_ms = int(match.group(1))
-            out_sec = out_ms / 1_000_000
-            progress = min(out_sec / total_duration, 1.0)
-
-            progress_bar.progress(progress)
-            status_text.text(
-                f"Processando: {progress*100:.1f}% "
-                f"({out_sec:.1f}s / {total_duration:.1f}s)"
-            )
-
-    process.wait()
-
-    if process.returncode != 0:
-        raise RuntimeError("Erro durante a compressão")
+    return response.content
 
 
 # =========================
@@ -165,11 +135,6 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 
-if not ffmpeg_exists():
-    st.error("FFmpeg não encontrado no sistema.")
-    st.stop()
-
-
 # =========================
 # Upload
 # =========================
@@ -179,25 +144,11 @@ st.markdown('</div>', unsafe_allow_html=True)
 
 
 if uploaded:
-    tmp = tempfile.mkdtemp()
-    input_path = os.path.join(tmp, uploaded.name)
-    with open(input_path, "wb") as f:
-        f.write(uploaded.getbuffer())
-
-    meta = ffprobe_json(input_path)
-    duration = float(meta["format"]["duration"])
-    size_in = os.path.getsize(input_path)
-
-    video_stream = next(
-        s for s in meta["streams"] if s["codec_type"] == "video")
-    width = int(video_stream["width"])
-    height = int(video_stream["height"])
+    size_in = len(uploaded.getvalue())
 
     st.markdown(f"""
     <div class="card">
-      <b>Tamanho original:</b> {human_size(size_in)}<br>
-      <b>Resolução:</b> {width}×{height}<br>
-      <b>Duração:</b> {duration:.1f}s
+      <b>Tamanho original:</b> {human_size(size_in)}
     </div>
     """, unsafe_allow_html=True)
 
@@ -206,7 +157,7 @@ if uploaded:
     # =========================
     st.markdown('<div class="card">', unsafe_allow_html=True)
 
-    preset = st.selectbox(
+    preset_ui = st.selectbox(
         "Perfil",
         [
             "YouTube 1080p (recomendado)",
@@ -217,61 +168,39 @@ if uploaded:
 
     crf = st.slider("Qualidade (CRF)", 18, 28, 22)
     speed = st.selectbox("Velocidade", ["fast", "medium"], index=0)
-    audio = st.selectbox("Áudio kbps", [128, 160, 192], index=1)
+
+    st.caption("CRF: quanto MAIOR, mais compressão e menor o arquivo.")
 
     st.markdown('</div>', unsafe_allow_html=True)
 
     # =========================
-    # Scale inteligente
+    # Preset backend
     # =========================
-    scale = None
-    if preset == "YouTube 1080p (recomendado)" and height > 1080:
-        scale = "scale=-2:1080"
-    elif preset == "YouTube 720p" and height > 720:
-        scale = "scale=-2:720"
-
-    vf = ["-vf", scale] if scale else []
-
-    output_path = os.path.join(tmp, f"compressed_{uploaded.name}")
+    if preset_ui == "YouTube 1080p (recomendado)":
+        preset_api = "1080p"
+    elif preset_ui == "YouTube 720p":
+        preset_api = "720p"
+    else:
+        preset_api = "original"
 
     # =========================
     # Run
     # =========================
     if st.button("🎬 Comprimir vídeo"):
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", input_path,
-            "-progress", "pipe:1",
-            "-nostats",
-            *vf,
-            "-c:v", "libx264",
-            "-preset", speed,
-            "-crf", str(crf),
-            "-profile:v", "high",
-            "-level", "4.2",
-            "-pix_fmt", "yuv420p",
-            "-g", "60",
-            "-keyint_min", "60",
-            "-sc_threshold", "0",
-            "-x264-params", "ref=4:bframes=3:aq-mode=2:aq-strength=1.0",
-            "-threads", str(os.cpu_count()),
-            "-c:a", "aac",
-            "-b:a", f"{audio}k",
-            "-movflags", "+faststart",
-            output_path
-        ]
+        with st.spinner("Enviando para compressão no servidor..."):
+            try:
+                output_bytes = compress_via_api(
+                    uploaded.getvalue(),
+                    preset=preset_api,
+                    crf=crf
+                )
+            except Exception as e:
+                st.error(f"Erro na compressão: {e}")
+                st.stop()
 
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        bar = st.progress(0.0)
-        status = st.empty()
+        size_out = len(output_bytes)
 
-        run_ffmpeg_with_progress(cmd, duration, bar, status)
-
-        bar.progress(1.0)
-        status.text("Compressão finalizada ✅")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        size_out = os.path.getsize(output_path)
+        st.success("Compressão finalizada ✅")
 
         st.markdown(f"""
         <div class="card">
@@ -280,13 +209,12 @@ if uploaded:
         </div>
         """, unsafe_allow_html=True)
 
-        with open(output_path, "rb") as f:
-            st.download_button(
-                "⬇️ Baixar vídeo comprimido",
-                f,
-                file_name=os.path.basename(output_path),
-                mime="video/mp4"
-            )
+        st.download_button(
+            "⬇️ Baixar vídeo comprimido",
+            output_bytes,
+            file_name="compressed.mp4",
+            mime="video/mp4"
+        )
 
 else:
     st.info("Envie um vídeo para começar.")
