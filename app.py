@@ -13,7 +13,7 @@ APP_NAME = "Olívia Claquete Crompress"
 BASE_DIR = Path(__file__).resolve().parent
 LOGO_PATH = BASE_DIR / "logo.png"
 
-API_URL = "http://0.0.0.0:8000"  # <<< ALTERE AQUI
+API_URL = "https://3e26-177-37-181-2.ngrok-free.app/compress"
 
 
 # =========================
